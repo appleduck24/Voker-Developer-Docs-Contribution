@@ -1,0 +1,115 @@
+import json
+import os
+import uuid
+from openai import OpenAI
+from voker import Voker
+
+ROOMS = {
+    "standard": {"available": True, "price": 120},
+    "suite": {"available": True, "price": 340},
+    "deluxe": {"available": True, "price": 210},
+}
+
+def check_availability(room_type: str) -> str:
+    room = ROOMS.get(room_type.lower())
+    if not room:
+        return json.dumps({"error": f"Unknown room type: {room_type}"})
+    if room["available"]:
+        return json.dumps({"available": True, "price": room["price"], "room_type": room_type})
+    return json.dumps({"available": False, "room_type": room_type})
+
+def book_room(room_type: str, guest_name: str, check_in: str, check_out: str) -> str:
+    room = ROOMS.get(room_type.lower())
+    if not room or not room["available"]:
+        return json.dumps({"success": False, "reason": "Room not available"})
+    return json.dumps({
+        "success": True,
+        "confirmation": f"CONF{hash(guest_name) % 10000:04d}",
+        "room_type": room_type,
+        "guest": guest_name,
+        "check_in": check_in,
+        "check_out": check_out,
+        "total": room["price"] * 3,
+    })
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_availability",
+            "description": "Check whether a specific room type is available.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_type": {"type": "string", "description": "The type of room to check (standard, suite, deluxe)."}
+                },
+                "required": ["room_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_room",
+            "description": "Book a room for a guest.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_type": {"type": "string"},
+                    "guest_name": {"type": "string"},
+                    "check_in": {"type": "string"},
+                    "check_out": {"type": "string"},
+                },
+                "required": ["room_type", "guest_name", "check_in", "check_out"],
+            },
+        },
+    },
+]
+
+voker = Voker(api_key=os.environ["VOKER_API_KEY"])
+base_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+def run_agent(conversation: list[dict]) -> str:
+    session_id = str(uuid.uuid4())
+    while True:
+        response = base_client.chat.completions.create(
+            model="gpt-4o",
+            messages=conversation,
+            tools=tools,
+            tool_choice="auto",
+            voker_agent="hotel-booking-agent",
+            voker_session=session_id,
+            voker_agent_version="1.0.0",
+        )
+        message = response.choices[0].message
+        if message.tool_calls:
+            conversation.append(message)
+            for tool_call in message.tool_calls:
+                name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+                if name == "check_availability":
+                    result = check_availability(**args)
+                elif name == "book_room":
+                    result = book_room(**args)
+                else:
+                    result = json.dumps({"error": "Unknown tool"})
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+        else:
+            return message.content
+
+system_prompt = """You are a hotel booking assistant. Help guests check availability and book rooms.
+Use the check_availability tool before booking. Be helpful and efficient."""
+
+conversation = [
+    {"role": "system", "content": system_prompt},
+    {"role": "user", "content": "I'd like to book a room for Alex Johnson, checking in April 5th and checking out April 8th. Something nice."},
+]
+
+print("Agent:", run_agent(conversation))
+
+conversation.append({"role": "user", "content": "Actually, I wanted the suite, not a standard room. Can you fix that?"})
+print("Agent:", run_agent(conversation))
